@@ -62,7 +62,7 @@ aptx <pkg> [args...]                  shorthand for `aptx run <pkg> [args...]`
 aptx run <pkg> [bin] [--] [args...]   run a binary in the sandbox
 aptx install <pkg> [bin...]           stage a package and shim its binaries
 aptx remove <pkg>... | --all          unstage packages and drop their shims
-aptx list                             staged packages, sizes, bins, shims
+aptx list                             staged packages, sizes, bins, shims, flags
 aptx ls <pkg>                         plan, executables and closure (stages it)
 aptx which <pkg> [bin]                store path of a binary (runs nothing)
 aptx shell <pkg> [--] [args...]       /bin/sh inside the sandbox (`-- -c 'cmd'`)
@@ -87,6 +87,43 @@ aptx cowsay -f tux "hi"     # -f is cowsay's flag, not aptx's
 
 aptx's own flags are not available in this form (`aptx --gpu cowsay` would be a
 global flag), so use `aptx run --gpu cowsay` when you need them.
+
+### Installing a program (and erasing it again)
+
+`aptx install` writes a shim per binary into `~/.local/bin`, so the program is
+on `PATH` and still runs sandboxed. Every `run` flag is accepted before the
+package name and **stored in the shim**, so the launch command does not have to
+be remembered:
+
+```console
+$ aptx install --gui --persist=qgis qgis
+installed qgis -> ~/.local/bin/qgis
+installed qgis.bin -> ~/.local/bin/qgis.bin
+  runs as: aptx run --gui --persist=qgis qgis <bin>
+  remove with: aptx remove qgis
+```
+
+`qgis` from then on opens a window with a `$HOME` that survives restarts.
+`aptx list` shows the stored flags in its `FLAGS` column.
+
+Staging-only flags are not stored: `--force-stage` would re-download the package
+on every start, and `--ephemeral`/`--dry-run` contradict a persistent shim (both
+are rejected). `--recommends` is stored, because the closure has to stay resolved
+the way the package was installed.
+
+One command erases everything again:
+
+```console
+$ aptx remove --purge qgis
+removed qgis and 2 shim(s): qgis, qgis.bin
+  removed shared home: ~/.cache/aptx/homes/qgis
+```
+
+`remove` drops the store entry (1.3 GB for QGIS), every shim that carries the
+`aptx` marker, and the private `--persist` home inside the entry. A
+`--persist=NAME` home is shared, so it is only deleted by `--purge`, and only
+when no other installed package still names it. Uninstalling `apt`-side on the
+host is never involved: nothing was installed there.
 
 ### Argument convention
 

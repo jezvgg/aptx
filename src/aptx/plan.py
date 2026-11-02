@@ -95,9 +95,16 @@ def build(entry: Entry, host=host_lexists, isdir=_is_dir) -> Plan:
     # tree, hiding every host path.
     rows = entry.provides()
     provided = {path for _kind, path, _owner in rows if path not in ("", "/")}
-    derived_dirs = {
-        path for path in provided if any(other.startswith(path + "/") for other in provided)
-    }
+    # Ancestors of the provided paths in one pass. Asking `any(other.startswith(p))`
+    # per path is quadratic: QGIS' closure lists 43k paths, which cost 98 s of CPU
+    # per plan build (the plan is not cached, so every run paid it again).
+    derived_dirs: set[str] = set()
+    for path in provided:
+        parent = path.rpartition("/")[0]
+        while parent:
+            if parent in provided:
+                derived_dirs.add(parent)
+            parent = parent.rpartition("/")[0]
 
     for kind, path, _owner in rows:
         if path in ("", "/") or path in derived_dirs:

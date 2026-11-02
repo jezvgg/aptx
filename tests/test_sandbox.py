@@ -310,6 +310,17 @@ class TestBwrapExtras:
         # /usr/lib must not be bound separately: /usr is a farm already.
         assert "/usr/lib" not in binds(args)
 
+    def test_gui_skips_a_bind_whose_destination_is_a_farm_symlink(self, tmp_path: Path):
+        entry = make_entry(tmp_path, files=["/usr/games/cowsay"])
+        stage_dir = tmp_path / "stage"
+        (stage_dir / "usr/share").mkdir(parents=True)
+        (stage_dir / "usr/share/X11").symlink_to("/run/aptx/host/usr!share/X11")
+        args = build_bwrap_argv(entry, PLAN, stage_dir, "/x", [], SandboxOptions(gui=True))
+        # bwrap refuses to mount over a symlink; the farm symlink already points
+        # at the host copy, so the bind is both illegal and redundant.
+        assert "/usr/share/X11" not in binds(args)
+        assert binds(args)["/usr/share/fonts"] == ("--ro-bind-try", "/usr/share/fonts")
+
 
 class TestProotExtras:
     def make_args(self, tmp_path: Path, plan: Plan, opts: SandboxOptions) -> list[str]:
@@ -625,3 +636,56 @@ class TestRootSandbox:
     def test_a_normal_user_drops_capabilities(self, tmp_path: Path):
         assert "--cap-add" not in argv_for(tmp_path)
 
+
+
+class TestOptsArgv:
+    """Flags are rendered back into CLI form for the shims `install` writes."""
+
+    def test_no_flags_means_an_empty_argv(self):
+        assert sandbox.opts_argv(SandboxOptions()) == []
+
+    def test_every_flag_is_rendered(self):
+        opts = SandboxOptions(
+            offline=True,
+            gpu=True,
+            gui=True,
+            persist="qgis",
+            rw_cwd=True,
+            dev=True,
+            recommends=True,
+            backend="proot",
+            no_sandbox=True,
+        )
+        opts.rw = ["/a:/b"]
+        opts.dev_binds = ["/dev/kvm"]
+        assert sandbox.opts_argv(opts) == [
+            "--offline",
+            "--gpu",
+            "--gui",
+            "--persist=qgis",
+            "--rw-cwd",
+            "--rw=/a:/b",
+            "--dev",
+            "--dev-bind=/dev/kvm",
+            "--recommends",
+            "--backend=proot",
+            "--no-sandbox",
+        ]
+
+    def test_the_auto_backend_is_left_out(self):
+        assert sandbox.opts_argv(SandboxOptions(backend="auto")) == []
+
+    def test_a_bare_persist_is_spelled_out(self):
+        # A bare `--persist` would swallow the next word if a flag ever followed.
+        assert sandbox.opts_argv(SandboxOptions(persist="default")) == ["--persist=default"]
+
+    def test_staging_only_flags_are_dropped(self):
+        # A shim replaying --force-stage would re-download the package every time.
+        opts = SandboxOptions(force_stage=True, dry_run=True, ephemeral=True)
+        assert sandbox.opts_argv(opts) == []
+
+    def test_the_result_is_accepted_by_the_cli(self):
+        from aptx import cli
+
+        opts = SandboxOptions(gui=True, persist="work")
+        assert cli.main(["run", *sandbox.opts_argv(opts), "--dry-run", "cowsay"]) != 2

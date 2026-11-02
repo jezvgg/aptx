@@ -543,6 +543,37 @@ class TestCmdInstall:
     def test_unknown_option(self):
         assert run("install", "--nope", "cowsay") == 2
 
+    def test_flags_are_stored_in_the_shim(self, monkeypatch, tmp_path: Path, capsys):
+        stage()
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        assert cli.main(["install", "--gui", "--persist=qgis", "cowsay"]) == 0
+        text = (tmp_path / "bin" / "cowsay").read_text(encoding="utf-8")
+        assert "run --gui --persist=qgis cowsay /usr/games/cowsay --" in text
+        assert "--gui --persist=qgis" in capsys.readouterr().out
+
+    def test_a_persisted_backend_reaches_the_shim(self, monkeypatch, tmp_path: Path):
+        stage()
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        assert cli.main(["install", "--backend=proot", "cowsay"]) == 0
+        text = (tmp_path / "bin" / "cowsay").read_text(encoding="utf-8")
+        assert "--backend=proot" in text
+
+    def test_recommends_reaches_staging(self, monkeypatch, tmp_path: Path):
+        stage()
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        seen: list[bool] = []
+        monkeypatch.setattr(
+            cli, "_staged", lambda pkg, recommends, force, backend="bwrap": seen.append(recommends) or store.get(pkg)
+        )
+        assert cli.main(["install", "--recommends", "cowsay"]) == 0
+        assert seen == [True]
+
+    @pytest.mark.parametrize("flag", ["--ephemeral", "--dry-run"])
+    def test_transient_flags_cannot_be_installed(self, flag: str, capsys):
+        stage()
+        assert cli.main(["install", flag, "cowsay"]) == 2
+        assert "cannot be installed" in capsys.readouterr().err
+
     def test_force_stages_before_shimming(self, monkeypatch, tmp_path: Path):
         entry = stage()
         monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
@@ -592,6 +623,57 @@ class TestCmdRemove:
     def test_unknown_option(self):
         assert run("remove", "--nope") == 2
 
+    def test_a_shared_home_is_only_reported_by_default(
+        self, monkeypatch, tmp_path: Path, capsys
+    ):
+        stage()
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        cli.main(["install", "--persist=shared", "cowsay"])
+        home = config.homes_dir() / "shared"
+        home.mkdir(parents=True)
+        assert cli.main(["remove", "cowsay"]) == 0
+        assert "pass --purge to delete it" in capsys.readouterr().out
+        assert home.is_dir()
+
+    def test_purge_deletes_an_unused_shared_home(self, monkeypatch, tmp_path: Path, capsys):
+        stage()
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        cli.main(["install", "--persist=shared", "cowsay"])
+        home = config.homes_dir() / "shared"
+        home.mkdir(parents=True)
+        assert cli.main(["remove", "--purge", "cowsay"]) == 0
+        assert "removed shared home" in capsys.readouterr().out
+        assert not home.exists()
+
+    def test_purge_keeps_a_home_another_package_still_uses(
+        self, monkeypatch, tmp_path: Path, capsys
+    ):
+        stage()
+        stage("moreutils", files=("/usr/bin/sponge",))
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        cli.main(["install", "--persist=shared", "cowsay"])
+        cli.main(["install", "--persist=shared", "moreutils"])
+        home = config.homes_dir() / "shared"
+        home.mkdir(parents=True)
+        assert cli.main(["remove", "--purge", "cowsay"]) == 0
+        assert "still used by another package" in capsys.readouterr().out
+        assert home.is_dir()
+        assert cli.main(["remove", "--purge", "moreutils"]) == 0
+        assert not home.exists()
+
+    def test_a_private_home_needs_no_purge(self, monkeypatch, tmp_path: Path, capsys):
+        entry = stage()
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        cli.main(["install", "--persist", "cowsay"])
+        private = entry.state_dir / "default"
+        private.mkdir(parents=True)
+        assert cli.main(["remove", "cowsay"]) == 0
+        assert not private.exists()
+        assert "shared home" not in capsys.readouterr().out
+
+    def test_all_with_purge_is_an_error(self):
+        assert run("remove", "--all", "--purge") == 2
+
 
 class TestCmdList:
     def test_empty_store(self, capsys):
@@ -607,6 +689,15 @@ class TestCmdList:
         out = capsys.readouterr().out
         assert "PACKAGE" in out and "SHIMS" in out
         assert "unshimmed:" in out and "moreutils" in out
+
+    def test_installed_flags_are_shown(self, monkeypatch, tmp_path: Path, capsys):
+        stage()
+        monkeypatch.setenv("APTX_BIN", str(tmp_path / "bin"))
+        cli.main(["install", "--gui", "cowsay"])
+        capsys.readouterr()
+        assert cli.main(["list"]) == 0
+        out = capsys.readouterr().out
+        assert "FLAGS" in out and "--gui" in out
 
     def test_long_binary_lists_are_truncated(self, capsys):
         stage(files=tuple(f"/usr/bin/b{index}" for index in range(6)))

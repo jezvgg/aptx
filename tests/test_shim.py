@@ -32,6 +32,51 @@ class TestShimText:
         entry = make_entry(tmp_path)
         assert shim.MARKER in shim.shim_text(entry, "/usr/games/cowsay")
 
+    def test_replays_the_flags_it_was_installed_with(self, tmp_path: Path):
+        entry = make_entry(tmp_path)
+        text = shim.shim_text(entry, "/usr/bin/qgis", ["--gui", "--persist=qgis"])
+        assert "run --gui --persist=qgis cowsay /usr/bin/qgis --" in text
+        assert f"{shim.FLAGS_PREFIX} --gui --persist=qgis" in text
+
+    def test_flags_land_before_the_package_name(self, tmp_path: Path):
+        # aptx parses flags *before* the package name and hands everything after
+        # it to the program, so a flag after the binary would be ignored.
+        entry = make_entry(tmp_path)
+        exec_line = shim.shim_text(entry, "/usr/bin/qgis", ["--gui"]).splitlines()[-1]
+        assert exec_line.index("--gui") < exec_line.index(" cowsay ")
+
+    def test_a_flag_with_spaces_stays_one_word(self, tmp_path: Path):
+        entry = make_entry(tmp_path)
+        assert "'--rw=/a b:/c'" in shim.shim_text(entry, "/usr/bin/x", ["--rw=/a b:/c"])
+
+    def test_no_flags_means_no_comment(self, tmp_path: Path):
+        entry = make_entry(tmp_path)
+        text = shim.shim_text(entry, "/usr/games/cowsay")
+        assert shim.FLAGS_PREFIX not in text
+
+
+class TestShimFlags:
+    def test_reads_back_what_install_wrote(self, tmp_path: Path, bin_dir: Path):
+        entry = make_entry(tmp_path)
+        flags = ["--gui", "--persist=qgis", "--rw=/a b:/c"]
+        target = shim.install(entry, "/usr/bin/qgis", flags=flags)
+        assert shim.shim_flags(target) == flags
+
+    def test_a_shim_without_flags_is_empty(self, tmp_path: Path, bin_dir: Path):
+        entry = make_entry(tmp_path)
+        assert shim.shim_flags(shim.install(entry, "/usr/games/cowsay")) == []
+
+    def test_an_unreadable_shim_is_empty(self, tmp_path: Path):
+        assert shim.shim_flags(tmp_path / "missing") == []
+
+    def test_a_hand_edited_quote_does_not_crash(self, tmp_path: Path):
+        target = tmp_path / "x"
+        target.write_text(
+            f"#!/bin/sh\n{shim.MARKER}\n{shim.FLAGS_PREFIX} --gui 'unbalanced\n",
+            encoding="utf-8",
+        )
+        assert shim.shim_flags(target) == ["--gui", "'unbalanced"]
+
 
 class TestInstall:
     def test_writes_an_executable(self, tmp_path: Path, bin_dir: Path):

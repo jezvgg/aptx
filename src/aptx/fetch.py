@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from rich.console import Console
@@ -32,8 +32,10 @@ from aptx.config import APT_RELATIONS_WANTED
 from aptx.errors import DataError, OsError_, UnavailableError
 
 # `  Depends: perl`, `  |Depends: foo`, `  PreDepends: libc6`
+# The `|` marks "another alternative follows", so it is captured: `a | b` must not
+# stage both, they are builds of the same files (libqt5gui5t64 vs libqt5gui5-gles).
 _RELATION_RE = re.compile(
-    r"^\s*\|?(?P<rel>Depends|PreDepends|Recommends|Suggests|Conflicts|Breaks|Replaces|Enhances):\s*(?P<target>.+?)\s*$"
+    r"^\s*(?P<alt>\|)?(?P<rel>Depends|PreDepends|Recommends|Suggests|Conflicts|Breaks|Replaces|Enhances):\s*(?P<target>.+?)\s*$"
 )
 _ARCH_SUFFIX_RE = re.compile(r":[a-zA-Z0-9-]+$")
 
@@ -91,37 +93,118 @@ def resolve_closure(pkg: str, *, recommends: bool = False) -> list[str]:
     if recommends:
         wanted.add("Recommends")
 
-    names: set[str] = set()
+    # ``apt-cache depends --recurse`` prints one block per package it walked
+    # (``name`` at column 0, relations indented) and one block per virtual
+    # package (``<name>``, providers indented). It prints a block for *every*
+    # alternative it walked too, including the branch apt would not install, so
+    # collecting the lines flat would pull in e.g. libqt5gui5-gles: a second
+    # build of the same files, which then shadows the host's libqt5gui5t64 and
+    # breaks PyQt5 (``undefined symbol ... version Qt_5``). The closure is
+    # therefore re-walked from *pkg* below, choosing one alternative per group.
+    blocks: dict[str, _Block] = {}
+    virtual: dict[str, set[str]] = {}
+    current = ""  # the block header relations below belong to
+    current_virtual = False
+    pending: list[str] = []
+
+    def block(name: str) -> _Block:
+        return blocks.setdefault(name, _Block())
+
+    def flush() -> None:
+        nonlocal pending
+        if pending and current:
+            block(current).any.append(pending)
+        pending = []
+
     for line in cp.stdout.splitlines():
         if not line.strip():
             continue
         match = _RELATION_RE.match(line)
         if match:
-            if match.group("rel") not in wanted:
+            if not current or match.group("rel") not in wanted:
                 continue
+            entry = block(current)
             target = match.group("target").strip()
-            if target.startswith("<"):  # virtual package, providers follow
+            if target.startswith("<"):  # satisfied by the virtual's providers
+                entry.virtual.add(target)
                 continue
-            names.add(_strip_arch(target))
+            name = _strip_arch(target)
+            if match.group("alt"):  # `a | b`: b follows on the next line
+                pending.append(name)
+                continue
+            if pending:
+                entry.any.append(pending + [name])
+                pending = []
+            else:
+                entry.need.add(name)
             continue
         if line[0].isspace():
-            # 4-space indented provider of a virtual package
-            provider = line.strip()
-            if provider.startswith("<") or not provider:
+            # A provider of the virtual package the previous line named.
+            provider = _strip_arch(line.strip())
+            if not provider or provider.startswith("<") or not current:
                 continue
-            names.add(_strip_arch(provider))
+            if current_virtual:
+                virtual.setdefault(current, set()).add(provider)
+            else:
+                block(current).providers.add(provider)
             continue
-        # column 0: block header = the package itself. Virtual packages get
-        # their own block too (``<perlapi-5.40.0>``) and are never downloadable.
+        # column 0: a block header, i.e. the package apt-cache walked into.
+        flush()
         header = line.strip()
-        if header.startswith("<"):
+        current_virtual = header.startswith("<")
+        if current_virtual:
+            current = header
+            virtual.setdefault(header, set())
             continue
-        names.add(_strip_arch(header))
+        current = _strip_arch(header)
+        block(current)
+    flush()
+
+    candidates = sorted({name for entry in blocks.values() for group in entry.any for name in group})
+    status = installed_status(candidates)
+
+    def choose(group: list[str]) -> str:
+        """Pick the alternative apt itself would be satisfied by.
+
+        The installed one wins: it is already on the host, so nothing gets bound
+        over it. Falling back to the first is what ``apt-get`` does when neither
+        is installed.
+        """
+        installed = [name for name in group if status.get(name, "").startswith("ii")]
+        return installed[0] if installed else group[0]
+
+    names: set[str] = {pkg}
+    stack = [pkg]
+    while stack:
+        entry = blocks.get(stack.pop())
+        if entry is None:
+            continue
+        reached: set[str] = set(entry.need) | set(entry.providers)
+        for group in entry.any:
+            reached.add(choose(group))
+        for target in entry.virtual:
+            reached |= virtual.get(target, set())
+        reached -= names
+        names |= reached
+        stack.extend(reached)
 
     names.discard("")
-    if pkg not in names:
-        names.add(pkg)
     return sorted(names)
+
+
+@dataclass
+class _Block:
+    """Dependencies of one package, as ``apt-cache depends`` groups them.
+
+    ``need`` holds mandatory names, ``any`` the ``a | b`` groups (one member is
+    chosen), ``virtual`` the ``<virtual>`` targets whose providers satisfy them
+    and ``providers`` the providers printed under a plain package block.
+    """
+
+    need: set[str] = field(default_factory=set)
+    any: list[list[str]] = field(default_factory=list)
+    virtual: set[str] = field(default_factory=set)
+    providers: set[str] = field(default_factory=set)
 
 
 def installed_status(names: list[str]) -> dict[str, str]:
