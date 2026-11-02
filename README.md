@@ -39,7 +39,7 @@ tool for trying out a CLI program without committing to it.
 ## Install
 
 ```console
-$ uv tool install git+https://example.com/aptx     # or: uv tool install .
+$ uv tool install git+https://github.com/jezvgg/aptx     # or: uv tool install .
 $ uvx --from . aptx doctor
 ```
 
