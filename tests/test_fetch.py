@@ -24,6 +24,20 @@ def fake(monkeypatch, stdout: str = "", returncode: int = 0, stderr: str = ""):
     return calls
 
 
+def fake_tools(monkeypatch, apt: str = "", dpkg: str = ""):
+    """Answer apt-cache and dpkg-query with different output."""
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        argv = [str(part) for part in argv]
+        calls.append(argv)
+        out = apt if argv[0] == "apt-cache" else dpkg
+        return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    monkeypatch.setattr(fetch.proc, "run", runner)
+    return calls
+
+
 class TestDebPath:
     def test_executable_file(self):
         assert fetch.DebPath("f", "/usr/bin/x", mode="-rwxr-xr-x").executable
@@ -77,6 +91,50 @@ class TestResolveClosure:
         out = "pkg\n  |Depends: alt\n"
         fake(monkeypatch, out)
         assert "alt" in fetch.resolve_closure("pkg")
+
+    def test_alternatives_prefer_the_one_installed_on_the_host(self, monkeypatch):
+        # The same files in two builds: staging the branch the host lacks binds
+        # it over the host copy, and PyQt5 then refuses to load.
+        out = (
+            "pkg\n  |Depends: libqt5gui5t64\n  Depends: libqt5gui5-gles\n"
+            "libqt5gui5t64\nlibqt5gui5-gles\n"
+        )
+        fake_tools(monkeypatch, apt=out, dpkg="ii\tlibqt5gui5t64\nun\tlibqt5gui5-gles\n")
+        assert fetch.resolve_closure("pkg") == ["libqt5gui5t64", "pkg"]
+
+    def test_alternatives_fall_back_to_the_first_choice(self, monkeypatch):
+        out = "pkg\n  |Depends: a\n  Depends: b\na\nb\n"
+        fake_tools(monkeypatch, apt=out, dpkg="")
+        assert fetch.resolve_closure("pkg") == ["a", "pkg"]
+
+    def test_a_group_ends_at_the_first_plain_relation(self, monkeypatch):
+        out = "pkg\n  |Depends: a\n  Depends: b\n  Depends: c\na\nb\nc\n"
+        fake_tools(monkeypatch, apt=out, dpkg="")
+        assert fetch.resolve_closure("pkg") == ["a", "c", "pkg"]
+
+    def test_a_block_header_alone_is_not_a_dependency(self, monkeypatch):
+        # `--recurse` prints a block for every alternative it walked into, so a
+        # header must not resurrect the branch that was not chosen.
+        fake(monkeypatch, "pkg\nlibqt5gui5-gles\n")
+        assert fetch.resolve_closure("pkg") == ["pkg"]
+
+    def test_an_unchosen_branch_brings_none_of_its_own_dependencies(self, monkeypatch):
+        # The real qgis shape: libqt5quick5-gles (an unchosen alternative) plain-
+        # depends on libqt5gui5-gles, which is why a flat parse staged the GLES
+        # build and shadowed the host's Qt.
+        out = (
+            "pkg\n  |Depends: libqt5gui5t64\n  Depends: libqt5gui5-gles\n"
+            "libqt5gui5t64\n  Depends: libqt5core5t64\n"
+            "libqt5gui5-gles\n  Depends: libgl1\n  Depends: libqt5core5t64\n"
+            "libgl1\nlibqt5core5t64\n"
+        )
+        fake_tools(monkeypatch, apt=out, dpkg="ii\tlibqt5gui5t64\n")
+        assert fetch.resolve_closure("pkg") == ["libqt5core5t64", "libqt5gui5t64", "pkg"]
+
+    def test_a_virtual_relation_is_satisfied_by_its_providers(self, monkeypatch):
+        out = "pkg\n  Depends: <libblas3>\n<libblas3>\n    libblas-provider\nlibblas-provider\n"
+        fake(monkeypatch, out)
+        assert fetch.resolve_closure("pkg") == ["libblas-provider", "pkg"]
 
     def test_architecture_suffix_is_stripped(self, monkeypatch):
         out = "pkg\n  Depends: libc6:amd64\n"

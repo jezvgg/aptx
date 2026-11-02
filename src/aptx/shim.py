@@ -19,6 +19,9 @@ from aptx.store import Entry
 
 MARKER = "# managed by aptx"
 
+#: Where a shim records the `aptx run` flags it replays (`aptx install --gui`).
+FLAGS_PREFIX = "# aptx-flags:"
+
 
 def aptx_command() -> str:
     """How to re-enter aptx from a shim."""
@@ -28,11 +31,23 @@ def aptx_command() -> str:
     return f"{shlex.quote(sys.executable)} -m aptx"
 
 
-def shim_text(entry: Entry, binpath: str) -> str:
+def shim_text(entry: Entry, binpath: str, flags: list[str] | None = None) -> str:
+    """The shim script itself.
+
+    *flags* are the `aptx run` flags the package was installed with, so
+    ``aptx install --gui qgis`` keeps opening a window without asking the user
+    to remember the flag. They are also recorded in a comment, because
+    ``aptx remove`` and ``aptx list`` read them back (:func:`shim_flags`).
+    """
+    extra = [shlex.quote(flag) for flag in flags or ()]
+    note = f"{MARKER} - remove with `aptx remove {entry.pkg}`\n"
+    if extra:
+        note += f"{FLAGS_PREFIX} {' '.join(extra)}\n"
+    replay = "".join(f" {flag}" for flag in extra)
     return (
         "#!/bin/sh\n"
-        f"{MARKER} - remove with `aptx remove {entry.pkg}`\n"
-        f'exec {aptx_command()} run {shlex.quote(entry.pkg)}'
+        f"{note}"
+        f"exec {aptx_command()} run{replay} {shlex.quote(entry.pkg)}"
         f' {shlex.quote(binpath)} -- "$@"\n'
     )
 
@@ -59,7 +74,9 @@ def shim_path(name: str) -> Path:
     return bin_dir() / base
 
 
-def install(entry: Entry, binpath: str, force: bool = False) -> Path:
+def install(
+    entry: Entry, binpath: str, force: bool = False, flags: list[str] | None = None
+) -> Path:
     target = shim_path(binpath)
     if target.exists() and not is_managed(target) and not force:
         raise CantCreateError(
@@ -68,7 +85,7 @@ def install(entry: Entry, binpath: str, force: bool = False) -> Path:
         )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(shim_text(entry, binpath), encoding="utf-8")
+        target.write_text(shim_text(entry, binpath, flags), encoding="utf-8")
         target.chmod(0o755)
     except OSError as exc:
         raise CantCreateError(f"could not write {target}: {exc}") from exc
@@ -116,6 +133,25 @@ def shim_package(path: Path) -> str:
         if tail:
             return tail.strip().split()[0].strip("`")
     return ""
+
+
+def shim_flags(path: Path) -> list[str]:
+    """The `aptx run` flags a shim replays, or ``[]`` when it has none."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        if not line.startswith(FLAGS_PREFIX):
+            continue
+        raw = line[len(FLAGS_PREFIX) :].strip()
+        try:
+            return shlex.split(raw)
+        except ValueError:
+            # A hand-edited shim with an unbalanced quote: keep the words rather
+            # than failing the whole `aptx remove`.
+            return raw.split()
+    return []
 
 
 def orphan_shims(known_packages: set[str]) -> list[Path]:

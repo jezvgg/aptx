@@ -432,65 +432,127 @@ def shell(**params: object) -> int:
     return launch()
 
 
-@cli.command()
+@cli.command(context_settings=PASSTHROUGH, cls=SandboxCommand)
+@sandbox_options
 @click.option("--force", is_flag=True, help="overwrite a file aptx did not create")
 @click.argument("pkg")
 @click.argument("bins", nargs=-1)
-def install(force: bool, pkg: str, bins: tuple[str, ...]) -> int:
+def install(**params: object) -> int:
     """Stage PKG and write a shim per binary into the bin dir.
 
     Each shim re-enters aptx, so the program always runs sandboxed. Without
     BIN the default binary is used; pass one name per wanted shim.
 
+    Every flag of `aptx run` is accepted here and stored in the shim, so
+    ``aptx install --gui qgis`` installs a launcher that always opens a window.
+
     \b
     examples:
       aptx install cowsay
       aptx install fio fio fio-genzipf
+      aptx install --gui --persist=qgis qgis
     """
-    entry = _staged(pkg, False, False)
-    wanted = list(bins) or [None]
-    _prepare(entry, sandbox.SandboxOptions(), force=force)
+    opts = _opts_from(params)
+    force = bool(params.get("force"))
+    pkg = str(params.get("pkg", ""))
+    if pkg.startswith("-"):
+        # Flags are parsed before this point, so a leading dash is a typo.
+        raise UsageError(f"no such option: {pkg}")
+    if opts.ephemeral or opts.dry_run:
+        raise UsageError(
+            f"--{'ephemeral' if opts.ephemeral else 'dry-run'} cannot be installed",
+            hint="install writes a persistent shim; stage the sandbox flags you want instead",
+        )
+    flags = sandbox.opts_argv(opts)
+    entry = _staged(pkg, opts.recommends, opts.force_stage, _backend_name(opts))
+    wanted = list(params.get("bins", ())) or [None]  # type: ignore[union-attr]
+    _prepare(entry, opts, force=force)
 
     for spec in wanted:
         binpath = _pick_bin(entry, spec)
-        target = shim.install(entry, binpath, force=force)
+        target = shim.install(entry, binpath, force=force, flags=flags)
         print(f"installed {Path(binpath).name} -> {target}")
+    if flags:
+        print(f"  runs as: {PROG} run {' '.join(flags)} {pkg} <bin>")
     print(f"  remove with: {PROG} remove {pkg}")
     return 0
 
 
 @cli.command()
 @click.option("--all", "all_", is_flag=True, help="remove every staged package")
+@click.option(
+    "--purge",
+    is_flag=True,
+    help="also delete the shared --persist homes the shims pointed at",
+)
 @click.argument("pkgs", nargs=-1)
-def remove(all_: bool, pkgs: tuple[str, ...]) -> int:
-    """Delete a package's shims and its store entry.
+def remove(all_: bool, purge: bool, pkgs: tuple[str, ...]) -> int:
+    """Delete a package's shims, its store entry and its state.
 
-    Only shim files carrying the aptx marker are touched.
+    Only shim files carrying the aptx marker are touched. A private
+    ``--persist`` home lives inside the store entry, so it goes away with it; a
+    ``--persist=NAME`` home is shared, so it is only reported unless --purge is
+    given and no other installed package still names it.
 
     \b
     examples:
       aptx remove cowsay
       aptx remove cowsay moreutils
+      aptx remove --purge qgis
       aptx remove --all
     """
     if all_:
         if pkgs:
             raise UsageError("--all takes no package names")
+        if purge:
+            raise UsageError("--purge takes package names")
         return _rm_all()
     if not pkgs:
         raise UsageError(f"{PROG} remove needs a package name or --all")
 
+    homes: set[str] = set()
     for pkg in pkgs:
         entry = store.get(pkg)
         if entry is None:
             raise NoInputError(f"{pkg} is not staged")
+        homes |= _shared_homes(entry)
         removed = shim.remove_all(entry)
         store.remove(pkg)
         if removed:
             print(f"removed {pkg} and {len(removed)} shim(s): {', '.join(removed)}")
         else:
             print(f"removed {pkg}")
+    _report_homes(homes, purge)
     return 0
+
+
+def _shared_homes(entry: Entry) -> set[str]:
+    """``--persist=NAME`` homes the shims of *entry* point at (``default`` is private)."""
+    homes: set[str] = set()
+    for path in shim.list_shims(entry):
+        for flag in shim.shim_flags(path):
+            name = flag.removeprefix("--persist=")
+            if flag.startswith("--persist=") and name and name != "default":
+                homes.add(name)
+    return homes
+
+
+def _report_homes(homes: set[str], purge: bool) -> None:
+    """Delete the shared homes nobody uses any more, report the rest."""
+    if not homes:
+        return
+    live: set[str] = set()
+    for other in store.list_entries():
+        live |= _shared_homes(other)
+    for name in sorted(homes):
+        path = config.homes_dir() / name
+        if name in live:
+            print(f"  kept shared home: {path} (still used by another package)")
+        elif not purge:
+            print(f"  kept shared home: {path} (pass --purge to delete it)")
+        elif path.exists():
+            fetch.rmtree(path)
+            print(f"  removed shared home: {path}")
 
 
 @cli.command("list")
@@ -507,6 +569,8 @@ def list_packages() -> int:
     table.add_column("SIZE", justify="right")
     table.add_column("BINS")
     table.add_column("SHIMS", justify="right")
+    # Only worth a column once something was installed with sandbox flags.
+    table.add_column("FLAGS", no_wrap=True)
 
     shims: dict[str, int] = {}
     for entry in entries:
@@ -514,10 +578,17 @@ def list_packages() -> int:
         names = ", ".join(Path(path).name for path in files[:4])
         if len(files) > 4:
             names += ", …"
-        count = len(shim.list_shims(entry))
+        found = shim.list_shims(entry)
+        count = len(found)
         shims[entry.pkg] = count
+        flags = shim.shim_flags(found[0]) if found else []
         table.add_row(
-            entry.pkg, entry.version(), proc.human_size(entry.size()), names, str(count)
+            entry.pkg,
+            entry.version(),
+            proc.human_size(entry.size()),
+            names,
+            str(count),
+            " ".join(flags),
         )
     CONSOLE.print(table)
 

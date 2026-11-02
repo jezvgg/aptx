@@ -87,6 +87,40 @@ def _home(user: str) -> str:
 PERSIST_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+def opts_argv(opts: SandboxOptions) -> list[str]:
+    """Render *opts* back to CLI flags, in the order `aptx run` accepts them.
+
+    `aptx install` writes these into the shim, so an installed package keeps
+    running with the flags it was installed with (`--gui`, `--persist`, ...).
+    Flags that only make sense while staging are deliberately left out: a shim
+    carrying `--force-stage` would re-download the package on every start.
+    """
+    argv: list[str] = []
+    if opts.offline:
+        argv.append("--offline")
+    if opts.gpu:
+        argv.append("--gpu")
+    if opts.gui:
+        argv.append("--gui")
+    if opts.persist is not None:
+        # Always the explicit spelling: a bare `--persist` in a shim would
+        # swallow the next word if a future flag ever follows it.
+        argv.append(f"--persist={opts.persist}")
+    if opts.rw_cwd:
+        argv.append("--rw-cwd")
+    argv.extend(f"--rw={spec}" for spec in opts.rw)
+    if opts.dev:
+        argv.append("--dev")
+    argv.extend(f"--dev-bind={spec}" for spec in opts.dev_binds)
+    if opts.recommends:
+        argv.append("--recommends")
+    if opts.backend != "auto":
+        argv.append(f"--backend={opts.backend}")
+    if opts.no_sandbox:
+        argv.append("--no-sandbox")
+    return argv
+
+
 def persist_home(opts: SandboxOptions, entry: Entry) -> Path:
     """Directory that backs ``$HOME`` under ``--persist``.
 
@@ -261,6 +295,13 @@ def build_bwrap_argv(
 
     if opts.gui:
         for source in GUI_BINDS:
+            # The farm mirrors a host directory the package does not touch as a
+            # symlink into /run/aptx/host, and bwrap refuses to mount over a
+            # symlink destination ("Can't mount on symlink destination"). The
+            # symlink already exposes exactly the host copy this bind would add,
+            # so skipping it is equivalent and keeps `--gui` working.
+            if (stage_dir / source.lstrip("/")).is_symlink():
+                continue
             args += ["--ro-bind-try", source, source]
         runtime = os.environ.get("XDG_RUNTIME_DIR")
         if runtime:
